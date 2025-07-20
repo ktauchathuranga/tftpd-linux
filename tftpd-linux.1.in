@@ -1,0 +1,84 @@
+.TH TFTPD-LINUX 1 "%%DATE%%" "tftpd-linux 1.0" "User Commands"
+.SH NAME
+tftpd-linux \- Simple TFTP server for Linux systems
+.SH SYNOPSIS
+.B tftpd-linux
+[\fIPORT\fR]
+.SH DESCRIPTION
+.B tftpd-linux
+is a simple TFTP (Trivial File Transfer Protocol) server that serves files from the current working directory. It's designed to be similar to tftpd64 but runs natively on Linux systems.
+
+The server supports both reading (downloading) and writing (uploading) files. It provides real-time progress tracking and handles multiple concurrent clients.
+
+.SH OPTIONS
+.TP
+\fIPORT\fR
+TCP port number to listen on. Default is 6969 for non-privileged operation. Port 69 is the standard TFTP port but requires root privileges.
+
+.SH EXAMPLES
+.TP
+Start server on default port 6969:
+.B cd /path/to/files && tftpd-linux
+
+.TP
+Start server on standard TFTP port 69 (requires root):
+.B cd /path/to/files && sudo tftpd-linux 69
+
+.TP
+Start server on custom port:
+.B cd /path/to/files && tftpd-linux 8069
+
+.SH USAGE
+.IP 1. 4
+Navigate to the directory containing files you want to serve
+.IP 2. 4
+Start the server with: \fBtftpd-linux [port]\fR
+.IP 3. 4
+Clients can connect using any TFTP client:
+   \fBtftp server_ip port\fR
+
+.SH FEATURES
+.IP \[bu] 2
+Serves files from current working directory
+.IP \[bu] 2
+Real-time progress tracking for file transfers
+.IP \[bu] 2
+Support for multiple concurrent clients
+.IP \[bu] 2
+Security: Prevents directory traversal attacks
+.IP \[bu] 2
+Both upload and download support
+.IP \[bu] 2
+Human-readable file size display
+.IP \[bu] 2
+Automatic port conflict detection
+
+.SH SECURITY
+The server implements basic security measures:
+.IP \[bu] 2
+Files are only served from the current directory and subdirectories
+.IP \[bu] 2
+Directory traversal attempts (../) are blocked
+.IP \[bu] 2
+No authentication - suitable for trusted networks only
+
+.SH FILES
+The server serves files from the current working directory where it was started.
+
+.SH EXIT STATUS
+.TP
+.B 0
+Success
+.TP
+.B 1
+Error (port in use, permission denied, etc.)
+
+.SH AUTHOR
+TFTP Server for Linux Systems
+
+.SH SEE ALSO
+.BR tftp (1),
+.BR tftpd (8)
+
+.SH BUGS
+Report bugs to: https://github.com/ktauchathuranga/tftpd-linux
