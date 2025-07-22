@@ -6,18 +6,25 @@ use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // TFTP Opcodes
 const RRQ: u16 = 1; // Read request
 const WRQ: u16 = 2; // Write request
 const DATA: u16 = 3; // Data packet
+const ACK: u16 = 4;  // Acknowledgment packet
 const ERROR: u16 = 5; // Error packet
 
 // Error codes
 const ERROR_FILE_NOT_FOUND: u16 = 1;
 const ERROR_ACCESS_VIOLATION: u16 = 2;
 const ERROR_ILLEGAL_OPERATION: u16 = 4;
+
+// WiFi-optimized constants
+const MAX_RETRIES: usize = 8; // Increased for WiFi
+const INITIAL_TIMEOUT_MS: u64 = 1000; // Start with 1 second
+const MAX_TIMEOUT_MS: u64 = 5000; // Max 5 seconds
+const PACKET_SIZE: usize = 512; // Standard TFTP packet size
 
 #[derive(Debug)]
 struct TFTPServer {
@@ -36,8 +43,6 @@ impl ProgressBar {
     fn new(filename: String) -> Self {
         let terminal_width = get_terminal_width();
         // Calculate available width for the progress bar itself
-        // Format: "[====>] 100% (XXX MB/XXX MB) - XX.X MB/s - filename"
-        // Reserve space for: brackets(2) + percentage(5) + sizes(~20) + speed(~12) + separators(~8) = ~47 chars
         let reserved_space = 47 + filename.len();
         let available_for_bar = if terminal_width > reserved_space + 10 {
             std::cmp::min(40, terminal_width - reserved_space)
@@ -76,14 +81,12 @@ impl ProgressBar {
             format!("{:.0}B/s", speed)
         };
 
-        // Create a shorter filename if needed
         let display_filename = if self.filename.len() > 15 {
             format!("{}...", &self.filename[..12])
         } else {
             self.filename.clone()
         };
 
-        // Create the progress line with more compact format
         let line = format!(
             "[{}] {}% ({}/{}) {} - {}",
             bar,
@@ -94,20 +97,17 @@ impl ProgressBar {
             display_filename
         );
 
-        // Truncate the line if it's still too long
         let final_line = if line.len() > self.terminal_width {
             format!("{}...", &line[..self.terminal_width.saturating_sub(3)])
         } else {
             line
         };
 
-        // Use ANSI escape sequence to clear the entire line, then print new content
         eprint!("\r\x1B[K{}", final_line);
         let _ = stderr().flush();
     }
 
     fn finish(&mut self, operation: &str, bytes: u64, addr: std::net::IpAddr) {
-        // Move to new line and print completion message
         eprintln!();
         println!(
             "[INFO] {} completed: {} ({}) {}",
@@ -123,34 +123,30 @@ impl ProgressBar {
     }
 
     fn error(&mut self, message: &str) {
-        // Move to new line and print error
         eprintln!();
         println!("[ERROR] {}: {}", self.filename, message);
     }
+
+    fn retry_info(&mut self, retry: usize, max_retries: usize) {
+        eprint!("\r\x1B[K[RETRY {}/{}] {} - Network timeout, retrying...", 
+                retry, max_retries, self.filename);
+        let _ = stderr().flush();
+    }
 }
 
-// Get terminal width using multiple methods, with fallback to 80 if unable to determine
 fn get_terminal_width() -> usize {
-    // Method 1: Try using libc ioctl (most reliable)
     if let Some(width) = get_terminal_width_ioctl() {
         return width;
     }
-
-    // Method 2: Try environment variables
     if let Some(width) = get_terminal_width_env() {
         return width;
     }
-
-    // Method 3: Try using stty command (fallback)
     if let Some(width) = get_terminal_width_stty() {
         return width;
     }
-
-    // Fallback to 80 columns
     80
 }
 
-// Method 1: Use libc ioctl to get terminal size (most reliable on Unix systems)
 fn get_terminal_width_ioctl() -> Option<usize> {
     use std::mem;
 
@@ -164,13 +160,12 @@ fn get_terminal_width_ioctl() -> Option<usize> {
 
     let mut ws: WinSize = unsafe { mem::zeroed() };
 
-    // TIOCGWINSZ constant varies by platform
     #[cfg(target_os = "linux")]
     const TIOCGWINSZ: libc::c_ulong = 0x5413;
     #[cfg(target_os = "macos")]
     const TIOCGWINSZ: libc::c_ulong = 0x40087468;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    const TIOCGWINSZ: libc::c_ulong = 0x5413; // Default to Linux value
+    const TIOCGWINSZ: libc::c_ulong = 0x5413;
 
     unsafe {
         if libc::ioctl(libc::STDOUT_FILENO, TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
@@ -181,7 +176,6 @@ fn get_terminal_width_ioctl() -> Option<usize> {
     None
 }
 
-// Method 2: Check environment variables
 fn get_terminal_width_env() -> Option<usize> {
     std::env::var("COLUMNS")
         .ok()
@@ -189,12 +183,10 @@ fn get_terminal_width_env() -> Option<usize> {
         .filter(|&w| w > 0)
 }
 
-// Method 3: Use stty command as fallback
 fn get_terminal_width_stty() -> Option<usize> {
     use std::process::Command;
 
     let output = Command::new("stty").arg("size").output().ok()?;
-
     let size_str = String::from_utf8(output.stdout).ok()?;
     let parts: Vec<&str> = size_str.trim().split_whitespace().collect();
 
@@ -203,6 +195,15 @@ fn get_terminal_width_stty() -> Option<usize> {
     } else {
         None
     }
+}
+
+// Adaptive timeout calculation
+fn calculate_timeout(retry: usize) -> Duration {
+    let timeout_ms = std::cmp::min(
+        INITIAL_TIMEOUT_MS * (2_u64.pow(retry as u32)),
+        MAX_TIMEOUT_MS
+    );
+    Duration::from_millis(timeout_ms)
 }
 
 impl TFTPServer {
@@ -216,7 +217,6 @@ impl TFTPServer {
     }
 
     fn clear_terminal(&self) {
-        // Clear terminal using ANSI escape codes
         print!("\x1B[2J\x1B[1;1H");
         let _ = stdout().flush();
     }
@@ -225,6 +225,9 @@ impl TFTPServer {
         self.clear_terminal();
 
         let socket = UdpSocket::bind(format!("0.0.0.0:{}", self.port))?;
+
+        // Optimize socket for better WiFi performance
+        self.optimize_socket(&socket)?;
 
         println!(" _    __ _             _        _ _                  ");
         println!("| |  / _| |           | |      | (_)                 ");
@@ -260,11 +263,43 @@ impl TFTPServer {
                         break;
                     }
                     eprintln!("[ERROR] Error receiving data: {}", e);
+                    thread::sleep(Duration::from_millis(100)); // Brief pause on error
                 }
             }
         }
 
         println!("\n[INFO] Server stopped.");
+        Ok(())
+    }
+
+    fn optimize_socket(&self, socket: &UdpSocket) -> Result<(), Box<dyn std::error::Error>> {
+        // Increase socket buffer sizes for better WiFi performance
+        const BUFFER_SIZE: usize = 256 * 1024; // 256KB
+
+        use std::os::unix::io::AsRawFd;
+        let fd = socket.as_raw_fd();
+
+        unsafe {
+            // Set receive buffer size
+            let optval = BUFFER_SIZE as libc::c_int;
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &optval as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+
+            // Set send buffer size
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &optval as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+
         Ok(())
     }
 
@@ -297,7 +332,6 @@ impl TFTPServer {
         let (filename, _mode) = self.parse_request(&data[2..])?;
         let filepath = self.directory.join(&filename);
 
-        // Security check - prevent directory traversal
         if !filepath.starts_with(&self.directory) {
             println!(
                 "[INFO] Access violation attempt: {} from {}",
@@ -327,12 +361,10 @@ impl TFTPServer {
             addr.port()
         );
 
-        // Create new socket for this transfer
         let transfer_socket = UdpSocket::bind("0.0.0.0:0")?;
-        transfer_socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+        self.optimize_socket(&transfer_socket)?;
 
         self.send_file(&filepath, addr, &transfer_socket, &filename, file_size)?;
-
         Ok(())
     }
 
@@ -344,7 +376,6 @@ impl TFTPServer {
         let (filename, _mode) = self.parse_request(&data[2..])?;
         let filepath = self.directory.join(&filename);
 
-        // Security check
         if !filepath.starts_with(&self.directory) {
             self.send_error(addr, ERROR_ACCESS_VIOLATION, "Access violation")?;
             return Ok(());
@@ -365,12 +396,10 @@ impl TFTPServer {
             );
         }
 
-        // Create new socket for this transfer
         let transfer_socket = UdpSocket::bind("0.0.0.0:0")?;
-        transfer_socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+        self.optimize_socket(&transfer_socket)?;
 
         self.receive_file(&filepath, addr, &transfer_socket, &filename)?;
-
         Ok(())
     }
 
@@ -383,61 +412,83 @@ impl TFTPServer {
         file_size: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut file = File::open(filepath)?;
-        let mut buffer = [0; 512];
+        let mut buffer = [0; PACKET_SIZE];
         let mut block_num: u16 = 1;
         let mut bytes_sent = 0u64;
         let mut progress_bar = ProgressBar::new(filename.to_string());
 
-        let start_time = std::time::Instant::now();
-        let mut last_update = std::time::Instant::now();
+        let start_time = Instant::now();
+        let mut last_update = Instant::now();
+        let mut consecutive_timeouts = 0;
 
         loop {
             let bytes_read = file.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
-            }
 
-            // Create DATA packet
             let mut packet = Vec::with_capacity(4 + bytes_read);
             packet.extend_from_slice(&DATA.to_be_bytes());
             packet.extend_from_slice(&block_num.to_be_bytes());
             packet.extend_from_slice(&buffer[..bytes_read]);
 
-            // Send with retries
             let mut retries = 0;
             let mut acked = false;
+            let mut ack_buffer = [0; 1024];
 
-            while retries < 5 && !acked {
+            while retries < MAX_RETRIES && !acked {
                 socket.send_to(&packet, addr)?;
 
-                match socket.recv_from(&mut [0; 1024]) {
-                    Ok((ack_size, _)) => {
-                        if ack_size >= 4 {
-                            // Simple ACK validation - in a full implementation,
-                            // we'd parse the ACK properly to check block number
-                            acked = true;
+                let timeout = calculate_timeout(retries);
+                socket.set_read_timeout(Some(timeout))?;
+
+                match socket.recv_from(&mut ack_buffer) {
+                    Ok((ack_size, recv_addr)) => {
+                        if recv_addr == addr && ack_size >= 4 {
+                            let ack_opcode = u16::from_be_bytes([ack_buffer[0], ack_buffer[1]]);
+                            let ack_block = u16::from_be_bytes([ack_buffer[2], ack_buffer[3]]);
+                            
+                            if ack_opcode == ACK && ack_block == block_num {
+                                acked = true;
+                                consecutive_timeouts = 0; // Reset timeout counter
+                            } else if ack_opcode == ACK && ack_block == block_num.wrapping_sub(1) {
+                                // Duplicate ACK, just continue
+                                continue;
+                            } else {
+                                retries += 1;
+                            }
                         }
                     }
                     Err(e) => {
-                        if e.kind() == std::io::ErrorKind::TimedOut {
+                        if e.kind() == std::io::ErrorKind::TimedOut 
+                           || e.kind() == std::io::ErrorKind::WouldBlock {
                             retries += 1;
+                            consecutive_timeouts += 1;
+                            
+                            if retries < MAX_RETRIES {
+                                progress_bar.retry_info(retries, MAX_RETRIES);
+                                
+                                // Add small delay for WiFi stability
+                                thread::sleep(Duration::from_millis(50 + (retries * 25) as u64));
+                            }
                         } else {
-                            return Err(e.into());
+                            return Err(format!("Network error: {}", e).into());
                         }
                     }
                 }
             }
 
             if !acked {
-                progress_bar.error("Transfer timeout");
+                progress_bar.error(&format!("Transfer failed after {} retries - network unstable", MAX_RETRIES));
                 return Ok(());
             }
 
-            bytes_sent += bytes_read as u64;
-            let now = std::time::Instant::now();
+            // Adaptive delay based on network conditions
+            if consecutive_timeouts > 3 {
+                thread::sleep(Duration::from_millis(100)); // Slow down on poor network
+            }
 
-            // Update progress every 100ms or when complete
-            if now.duration_since(last_update).as_millis() >= 100 || bytes_read < 512 {
+            bytes_sent += bytes_read as u64;
+            let now = Instant::now();
+
+            if now.duration_since(last_update).as_millis() >= 100 || bytes_read < PACKET_SIZE {
                 let progress = if file_size > 0 {
                     ((bytes_sent * 100) / file_size) as u32
                 } else {
@@ -457,8 +508,7 @@ impl TFTPServer {
 
             block_num = block_num.wrapping_add(1);
 
-            // If less than 512 bytes, this is the last packet
-            if bytes_read < 512 {
+            if bytes_read < PACKET_SIZE {
                 break;
             }
         }
@@ -474,8 +524,7 @@ impl TFTPServer {
         socket: &UdpSocket,
         filename: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Send ACK 0 to start transfer
-        let ack_packet = [0, 4, 0, 0]; // ACK opcode + block 0
+        let ack_packet = [0, 4, 0, 0];
         socket.send_to(&ack_packet, addr)?;
 
         let mut file = OpenOptions::new()
@@ -488,17 +537,22 @@ impl TFTPServer {
         let mut bytes_received = 0u64;
         let mut buffer = [0; 1024];
         let mut progress_bar = ProgressBar::new(filename.to_string());
+        let mut consecutive_timeouts = 0;
 
-        let start_time = std::time::Instant::now();
-        let mut last_update = std::time::Instant::now();
-        let mut last_progress = 0u32; // Track last progress to avoid redundant updates
+        let start_time = Instant::now();
+        let mut last_update = Instant::now();
+        let mut last_progress = 0u32;
+
+        socket.set_read_timeout(Some(Duration::from_millis(INITIAL_TIMEOUT_MS * 2)))?;
 
         loop {
             match socket.recv_from(&mut buffer) {
-                Ok((size, _)) => {
-                    if size < 4 {
+                Ok((size, recv_addr)) => {
+                    if recv_addr != addr || size < 4 {
                         continue;
                     }
+
+                    consecutive_timeouts = 0; // Reset on successful receive
 
                     let opcode = u16::from_be_bytes([buffer[0], buffer[1]]);
                     let block_num = u16::from_be_bytes([buffer[2], buffer[3]]);
@@ -508,23 +562,19 @@ impl TFTPServer {
                         file.write_all(file_data)?;
                         bytes_received += file_data.len() as u64;
 
-                        // Send ACK
-                        let ack_packet = [0, 4, buffer[2], buffer[3]]; // ACK + block number
+                        let ack_packet = [0, 4, buffer[2], buffer[3]];
                         socket.send_to(&ack_packet, addr)?;
 
-                        let now = std::time::Instant::now();
-                        let is_last_packet = file_data.len() < 512;
+                        let now = Instant::now();
+                        let is_last_packet = file_data.len() < PACKET_SIZE;
 
-                        // Calculate progress
                         let progress = if is_last_packet {
-                            100 // Last packet, show 100%
+                            100
                         } else {
-                            // Show progress based on data received, but cap at 95% until complete
                             let mb_received = bytes_received / (1024 * 1024);
-                            std::cmp::min((mb_received * 2).min(95) as u32, 95) // More gradual progress
+                            std::cmp::min((mb_received * 2).min(95) as u32, 95)
                         };
 
-                        // Only update progress if enough time has passed OR progress has changed OR it's the last packet
                         let should_update = now.duration_since(last_update).as_millis() >= 100
                             || progress != last_progress
                             || is_last_packet;
@@ -544,23 +594,39 @@ impl TFTPServer {
 
                         expected_block = expected_block.wrapping_add(1);
 
-                        // Last packet (less than 512 bytes of data)
                         if is_last_packet {
                             break;
                         }
                     } else if opcode == DATA {
-                        // Resend last ACK for duplicate or out-of-order packet
-                        let prev_block = expected_block.wrapping_sub(1);
-                        let ack_packet = [0, 4, (prev_block >> 8) as u8, prev_block as u8];
-                        socket.send_to(&ack_packet, addr)?;
+                        if block_num == expected_block.wrapping_sub(1) {
+                            let prev_block = expected_block.wrapping_sub(1);
+                            let ack_packet = [0, 4, (prev_block >> 8) as u8, prev_block as u8];
+                            socket.send_to(&ack_packet, addr)?;
+                        }
+                    } else if opcode == ERROR {
+                        let error_code = u16::from_be_bytes([buffer[2], buffer[3]]);
+                        let error_msg = String::from_utf8_lossy(&buffer[4..size-1]);
+                        progress_bar.error(&format!("Client error {}: {}", error_code, error_msg));
+                        return Ok(());
                     }
                 }
                 Err(e) => {
-                    if e.kind() == std::io::ErrorKind::TimedOut {
-                        progress_bar.error("Transfer timeout");
-                        return Ok(());
+                    if e.kind() == std::io::ErrorKind::TimedOut 
+                       || e.kind() == std::io::ErrorKind::WouldBlock {
+                        consecutive_timeouts += 1;
+                        
+                        if consecutive_timeouts >= MAX_RETRIES {
+                            progress_bar.error("Transfer timeout - network unstable");
+                            return Ok(());
+                        }
+                        
+                        // Increase timeout on consecutive failures
+                        let new_timeout = calculate_timeout(consecutive_timeouts);
+                        socket.set_read_timeout(Some(new_timeout))?;
+                        
+                        continue;
                     }
-                    return Err(e.into());
+                    return Err(format!("Network error: {}", e).into());
                 }
             }
         }
@@ -613,7 +679,6 @@ impl TFTPServer {
     }
 
     fn get_local_ip(&self) -> String {
-        // Simple way to get local IP - connect to a remote address
         match UdpSocket::bind("0.0.0.0:0") {
             Ok(socket) => {
                 if let Ok(_) = socket.connect("8.8.8.8:80") {
@@ -685,7 +750,7 @@ fn format_size_compact(bytes: u64) -> String {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let mut port = 6969u16; // Default non-privileged port
+    let mut port = 6969u16;
 
     if args.len() > 1 {
         match args[1].parse::<u16>() {
@@ -697,7 +762,6 @@ fn main() {
         }
     }
 
-    // Check if we need root for ports < 1024
     if port < 1024 && unsafe { libc::geteuid() } != 0 {
         println!(
             "[INFO] Port {} requires root privileges. Using port 6969 instead.",
